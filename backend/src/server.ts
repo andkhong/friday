@@ -50,7 +50,7 @@ const limiter = rateLimit({
 app.use('/api/', limiter)
 
 // Request logging
-app.use((req: Request, res: Response, next: NextFunction) => {
+app.use((req: Request, _res: Response, next: NextFunction) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`)
   next()
 })
@@ -62,19 +62,21 @@ interface AuthRequest extends Request {
 }
 
 // JWT verification middleware (simplified - use proper JWT in production)
-const authenticateUser = async (req: AuthRequest, res: Response, next: NextFunction) => {
+const authenticateUser = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const token = req.headers.authorization?.split(' ')[1]
-    
+
     if (!token) {
-      return res.status(401).json({ error: 'Authentication required' })
+      res.status(401).json({ error: 'Authentication required' })
+      return
     }
 
     // Verify JWT with Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token)
-    
+
     if (error || !user) {
-      return res.status(401).json({ error: 'Invalid or expired token' })
+      res.status(401).json({ error: 'Invalid or expired token' })
+      return
     }
 
     req.userId = user.id
@@ -339,6 +341,253 @@ app.get('/api/transactions/summary', authenticateUser, async (req: AuthRequest, 
   }
 })
 
+// ==================== CREDIT CARDS ====================
+
+// Get all credit cards for user
+app.get('/api/cards', authenticateUser, async (req: AuthRequest, res: Response) => {
+  try {
+    const { data, error } = await supabase
+      .from('credit_cards')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+
+    if (error) throw error
+
+    res.json({ cards: data })
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Add new credit card
+app.post('/api/cards', authenticateUser, async (req: AuthRequest, res: Response) => {
+  try {
+    const {
+      cardName,
+      issuer,
+      network,
+      lastFour,
+      annualFee,
+      interestRate,
+      creditLimit,
+      rewardsStructure,
+      benefits,
+      signupBonus,
+      signupBonusSpendRequirement,
+      foreignTransactionFee,
+      isActive
+    } = req.body
+
+    // Validate required fields
+    if (!cardName || !issuer || !network || !lastFour) {
+      res.status(400).json({
+        error: 'Missing required fields: cardName, issuer, network, lastFour'
+      })
+      return
+    }
+
+    const { data, error } = await supabase
+      .from('credit_cards')
+      .insert({
+        user_id: req.userId,
+        card_name: cardName,
+        issuer,
+        network,
+        last_four: lastFour,
+        annual_fee: annualFee || 0,
+        interest_rate: interestRate || 0,
+        credit_limit: creditLimit || null,
+        current_balance: 0,
+        rewards_structure: rewardsStructure || { base_rate: 1 },
+        benefits: benefits || [],
+        signup_bonus: signupBonus || null,
+        signup_bonus_spend_requirement: signupBonusSpendRequirement || null,
+        foreign_transaction_fee: foreignTransactionFee || 0,
+        is_active: isActive !== undefined ? isActive : true
+      })
+      .select()
+      .single()
+
+    if (error) throw error
+
+    res.status(201).json({
+      message: 'Credit card added successfully',
+      card: data
+    })
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Update credit card
+app.put('/api/cards/:id', authenticateUser, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id } = req.params
+    const updateData: any = {}
+
+    // Only update fields that are provided
+    const allowedFields = [
+      'card_name', 'annual_fee', 'interest_rate', 'credit_limit',
+      'current_balance', 'rewards_structure', 'benefits',
+      'signup_bonus', 'signup_bonus_spend_requirement',
+      'foreign_transaction_fee', 'is_active'
+    ]
+
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        updateData[field] = req.body[field]
+      }
+    })
+
+    if (Object.keys(updateData).length === 0) {
+      res.status(400).json({ error: 'No valid fields to update' })
+      return
+    }
+
+    const { data, error } = await supabase
+      .from('credit_cards')
+      .update(updateData)
+      .eq('id', id)
+      .eq('user_id', req.userId) // Ensure user owns this card
+      .select()
+      .single()
+
+    if (error) throw error
+    if (!data) {
+      res.status(404).json({ error: 'Card not found' })
+      return
+    }
+
+    res.json({
+      message: 'Credit card updated successfully',
+      card: data
+    })
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Delete credit card
+app.delete('/api/cards/:id', authenticateUser, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id } = req.params
+
+    const { data, error } = await supabase
+      .from('credit_cards')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', req.userId) // Ensure user owns this card
+      .select()
+      .single()
+
+    if (error) throw error
+    if (!data) {
+      res.status(404).json({ error: 'Card not found' })
+      return
+    }
+
+    res.json({
+      message: 'Credit card deleted successfully',
+      card: data
+    })
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Quick recommend - Mobile-optimized endpoint
+app.post('/api/cards/quick-recommend', authenticateUser, async (req: AuthRequest, res: Response) => {
+  try {
+    const { merchant, amount, category } = req.body
+
+    if (!amount) {
+      res.status(400).json({ error: 'Amount is required' })
+      return
+    }
+
+    // Get user's active credit cards
+    const { data: cards, error } = await supabase
+      .from('credit_cards')
+      .select('*')
+      .eq('user_id', req.userId)
+      .eq('is_active', true)
+
+    if (error) throw error
+
+    if (!cards || cards.length === 0) {
+      res.status(404).json({
+        error: 'No active credit cards found',
+        message: 'Please add at least one credit card to get recommendations'
+      })
+      return
+    }
+
+    // Determine category if not provided
+    let txnCategory = category
+    if (!txnCategory && merchant) {
+      txnCategory = await categorizeTransaction(merchant, merchant)
+    }
+
+    // Calculate rewards for each card
+    const cardRewards = cards.map(card => {
+      const rewardsStructure = card.rewards_structure || { base_rate: 1 }
+      let rewardRate = rewardsStructure.base_rate || 1
+
+      // Check if there's a category match
+      if (txnCategory && rewardsStructure.categories) {
+        const categoryKey = txnCategory.toLowerCase()
+        rewardRate = rewardsStructure.categories[categoryKey] || rewardsStructure.base_rate || 1
+      }
+
+      const rewardsAmount = (Number(amount) * rewardRate) / 100
+
+      return {
+        card_id: card.id,
+        card_name: card.card_name,
+        issuer: card.issuer,
+        network: card.network,
+        last_four: card.last_four,
+        reward_rate: rewardRate,
+        rewards_amount: parseFloat(rewardsAmount.toFixed(2)),
+        category: txnCategory || 'General'
+      }
+    })
+
+    // Sort by rewards amount (highest first)
+    cardRewards.sort((a, b) => b.rewards_amount - a.rewards_amount)
+
+    const recommended = cardRewards[0]
+    const alternatives = cardRewards.slice(1, 3) // Top 2 alternatives
+
+    // Calculate savings vs second best card
+    const savingsVsDefault = cardRewards.length > 1
+      ? parseFloat((recommended.rewards_amount - cardRewards[1].rewards_amount).toFixed(2))
+      : 0
+
+    res.json({
+      recommended_card: {
+        id: recommended.card_id,
+        name: recommended.card_name,
+        network: recommended.network,
+        last_four: recommended.last_four
+      },
+      expected_rewards: recommended.rewards_amount,
+      rewards_rate: recommended.reward_rate,
+      savings_vs_default: savingsVsDefault,
+      category: recommended.category,
+      reasoning: `This card offers ${recommended.reward_rate}% rewards for ${recommended.category} purchases. You'll earn $${recommended.rewards_amount} on this $${amount} transaction.`,
+      alternatives: alternatives.map(alt => ({
+        name: alt.card_name,
+        rewards_amount: alt.rewards_amount,
+        reward_rate: alt.reward_rate
+      }))
+    })
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
 // ==================== AI RECOMMENDATIONS ====================
 
 // Generate AI recommendations
@@ -415,7 +664,8 @@ app.get('/api/recommendations/card-optimizer', authenticateUser, async (req: Aut
     const { merchant, amount } = req.query
 
     if (!merchant || !amount) {
-      return res.status(400).json({ error: 'Merchant and amount required' })
+      res.status(400).json({ error: 'Merchant and amount required' })
+      return
     }
 
     // Get user's credit cards
@@ -547,7 +797,7 @@ Respond with only the category name.`
 
 // ==================== ERROR HANDLING ====================
 
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err.stack)
   res.status(500).json({ error: 'Internal server error' })
 })
